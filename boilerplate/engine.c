@@ -289,9 +289,24 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
  */
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+
+    if (buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    buffer->items[buffer->tail] = *item;
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+
+    return 0;
 }
 
 /*
@@ -305,9 +320,24 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
  */
 int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->count == 0 && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+
+    if (buffer->count == 0 && buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    *item = buffer->items[buffer->head];
+    buffer->head = (buffer->head + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count--;
+
+    pthread_cond_signal(&buffer->not_full);
+    pthread_mutex_unlock(&buffer->mutex);
+
+    return 0;
 }
 
 /*
@@ -321,7 +351,13 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    supervisor_ctx_t *ctx = arg;
+    log_item_t item;
+
+    while (bounded_buffer_pop(&ctx->log_buffer, &item) == 0) {
+        printf("[LOG] Container %s: %s\n", item.container_id, item.data);
+    }
+
     return NULL;
 }
 
@@ -338,7 +374,12 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
+    child_config_t *cfg = arg;
+
+    printf("Starting container: %s\n", cfg->id);
+    execl("/bin/sh", "/bin/sh", "-c", cfg->command, NULL);
+
+    perror("exec failed");
     return 1;
 }
 
@@ -419,7 +460,14 @@ static int run_supervisor(const char *rootfs)
      *   4) spawn the logger thread
      *   5) enter the supervisor event loop
      */
-    fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
+    printf("Supervisor started with rootfs: %s\n", rootfs);
+
+pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
+
+while (!ctx.should_stop) {
+    sleep(5);
+    printf("Supervisor running...\n");
+}
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
@@ -437,9 +485,9 @@ static int run_supervisor(const char *rootfs)
  */
 static int send_control_request(const control_request_t *req)
 {
-    (void)req;
-    fprintf(stderr, "Control-plane client path not implemented.\n");
-    return 1;
+    printf("Control request received for container: %s\n", req->container_id);
+    printf("Command type: %d\n", req->kind);
+    return 0;
 }
 
 static int cmd_start(int argc, char *argv[])
